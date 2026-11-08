@@ -70,7 +70,7 @@ bot.command('apagar', async (ctx) => {
 // Função auxiliar para salvar com Gemini
 async function processarGasto(ctx, partesConteudo) {
   try {
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.8-flash' });
     const prompt = `Extraia os dados deste gasto (texto, áudio ou comprovante/recibo) e retorne APENAS um JSON puro (sem markdown e sem crases) neste formato exato:
     {"data": "DD/MM/AAAA", "estabelecimento": "nome curto", "categoria": "Mercado/Refeição/Transporte/Casa/Lazer/Outros", "valor": 0.00, "pagamento": "Pix/Crédito/Débito/Dinheiro"}
     Use ponto nos centavos (ex: 35.90). Data de hoje se não informada: ${new Date().toLocaleDateString('pt-BR')}.`;
