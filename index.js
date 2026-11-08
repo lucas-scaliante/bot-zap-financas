@@ -1,148 +1,118 @@
-const { default: makeWASocket, useMultiFileAuthState, downloadMediaMessage, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Telegraf } = require('telegraf');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
-const QRCode = require('qrcode');
-const pino = require('pino');
 
 const app = express();
-const genAI = new GoogleGenerativeAI((process.env.GEMINI_API_KEY || '').trim());
-const supabase = createClient((process.env.SUPABASE_URL || '').trim(), (process.env.SUPABASE_KEY || '').trim());
-let qrCodeAtual = null;
-let statusConexao = 'Iniciando...';
-
-app.get('/', async (req, res) => {
-  if (qrCodeAtual) {
-    const qrImage = await QRCode.toDataURL(qrCodeAtual);
-    return res.send(`<h2>Escaneie com o WhatsApp do seu iPhone:</h2><img src="${qrImage}" style="width:300px;"/><p>Status: ${statusConexao}</p>`);
-  }
-  res.send(`<h2>Status do Bot: ${statusConexao}</h2><p>Atualize a página em 5 segundos se estiver aguardando o QR Code.</p>`);
-});
+app.get('/', (req, res) => res.send('✅ Bot do Telegram rodando!'));
 app.listen(process.env.PORT || 3000);
 
-async function iniciarBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('sessao_wa');
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' })
-  });
+const bot = new Telegraf((process.env.TELEGRAM_TOKEN || '').trim());
+const genAI = new GoogleGenerativeAI((process.env.GEMINI_API_KEY || '').trim());
+const supabase = createClient((process.env.SUPABASE_URL || '').trim(), (process.env.SUPABASE_KEY || '').trim());
 
-  sock.ev.on('creds.update', saveCreds);
+// 1. Comando /start ou /ajuda
+bot.start((ctx) => {
+  ctx.reply('👋 Olá! Mande qualquer gasto por *texto*, *áudio* ou *foto de recibo*.\n\nComandos:\n/resumo - Ver gastos do mês\n/apagar - Apagar o último gasto', { parse_mode: 'Markdown' });
+});
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      qrCodeAtual = qr;
-      statusConexao = 'Aguardando leitura do QR Code';
+// 2. Comando /resumo
+bot.command('resumo', async (ctx) => {
+  try {
+    const { data: gastos, error } = await supabase.from('gastos').select('*').order('id', { ascending: false });
+    if (error) throw new Error(error.message);
+    if (!gastos || !gastos.length) return ctx.reply('📭 Nenhum gasto registrado ainda.');
+
+    let totalGeral = 0;
+    const porCategoria = {};
+    gastos.forEach(g => {
+      const val = Number(g.valor) || 0;
+      totalGeral += val;
+      porCategoria[g.categoria] = (porCategoria[g.categoria] || 0) + val;
+    });
+
+    let msg = `📊 *RESUMO DE GASTOS*\n💰 *Total Geral:* R$ ${totalGeral.toFixed(2)}\n\n*Por Categoria:*\n`;
+    for (const [cat, val] of Object.entries(porCategoria)) {
+      msg += `• ${cat}: R$ ${val.toFixed(2)}\n`;
     }
-    if (connection === 'open') {
-      qrCodeAtual = null;
-      statusConexao = '✅ Conectado e Funcionando!';
+
+    msg += `\n🧾 *Últimos 5 lançamentos:*\n`;
+    gastos.slice(0, 5).forEach(g => {
+      msg += `[ID ${g.id}] ${g.data} - ${g.estabelecimento}: R$ ${Number(g.valor).toFixed(2)} (${g.pagamento})\n`;
+    });
+
+    ctx.reply(msg, { parse_mode: 'Markdown' });
+  } catch (e) {
+    ctx.reply('❌ Erro ao buscar resumo: ' + e.message);
+  }
+});
+
+// 3. Comando /apagar
+bot.command('apagar', async (ctx) => {
+  try {
+    const partes = ctx.message.text.split(' ');
+    const idAlvo = partes[1];
+    if (idAlvo) {
+      await supabase.from('gastos').delete().eq('id', Number(idAlvo));
+      return ctx.reply(`🗑️ Gasto ID ${idAlvo} removido!`);
     }
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      statusConexao = 'Desconectado. Reconectando...';
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(iniciarBot, 3000);
-      } else {
-        statusConexao = '❌ Sessão encerrada no celular. Reinicie o serviço no Render para gerar novo QR Code.';
-      }
+    const { data } = await supabase.from('gastos').select('id').order('id', { ascending: false }).limit(1);
+    if (data && data.length) {
+      await supabase.from('gastos').delete().eq('id', data[0].id);
+      return ctx.reply(`🗑️ Último gasto (ID ${data[0].id}) removido!`);
     }
-  });
+    ctx.reply('📭 Nada para apagar.');
+  } catch (e) {
+    ctx.reply('❌ Erro ao apagar: ' + e.message);
+  }
+});
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || !msg.key.fromMe) return;
+// Função auxiliar para salvar com Gemini
+async function processarGasto(ctx, partesConteudo) {
+  try {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const prompt = `Extraia os dados deste gasto (texto, áudio ou comprovante/recibo) e retorne APENAS um JSON puro (sem markdown e sem crases) neste formato exato:
+    {"data": "DD/MM/AAAA", "estabelecimento": "nome curto", "categoria": "Mercado/Refeição/Transporte/Casa/Lazer/Outros", "valor": 0.00, "pagamento": "Pix/Crédito/Débito/Dinheiro"}
+    Use ponto nos centavos (ex: 35.90). Data de hoje se não informada: ${new Date().toLocaleDateString('pt-BR')}.`;
 
-    const jid = msg.key.remoteJid;
-    const texto = (msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || '').trim();
-    const temImagem = !!msg.message.imageMessage;
+    const result = await model.generateContent([prompt, ...partesConteudo]);
+    const limpo = result.response.text().replace(/```json|```/g, '').trim();
+    const dados = JSON.parse(limpo);
 
-    if (!texto.startsWith('#')) return;
-    const comando = texto.toLowerCase();
+    const { data: inserido, error } = await supabase.from('gastos').insert([dados]).select();
+    if (error) throw new Error(error.message);
 
-    // Ignora as próprias respostas do bot para não criar loop
-    if (texto.includes('*Salvo [ID') || texto.includes('*RESUMO DE GASTOS*') || texto.startsWith('❌')) return;
-
-    try {
-      // 1. COMANDO #RESUMO
-      if (comando === '#resumo') {
-        const { data: gastos, error } = await supabase.from('gastos').select('*').order('id', { ascending: false });
-        if (error) throw new Error('Supabase: ' + error.message);
-        if (!gastos || !gastos.length) {
-          return sock.sendMessage(jid, { text: '📭 Nenhum gasto registrado ainda.' });
-        }
-
-        let totalGeral = 0;
-        const porCategoria = {};
-        gastos.forEach(g => {
-          const val = Number(g.valor) || 0;
-          totalGeral += val;
-          porCategoria[g.categoria] = (porCategoria[g.categoria] || 0) + val;
-        });
-
-        let resposta = `📊 *RESUMO DE GASTOS*\n💰 *Total Geral:* R$ ${totalGeral.toFixed(2)}\n\n*Por Categoria:*\n`;
-        for (const [cat, val] of Object.entries(porCategoria)) {
-          resposta += `• ${cat}: R$ ${val.toFixed(2)}\n`;
-        }
-
-        resposta += `\n🧾 *Últimos 5 lançamentos:*\n`;
-        gastos.slice(0, 5).forEach(g => {
-          resposta += `[ID ${g.id}] ${g.data} - ${g.estabelecimento}: R$ ${Number(g.valor).toFixed(2)} (${g.pagamento})\n`;
-        });
-
-        return sock.sendMessage(jid, { text: resposta });
-      }
-
-      // 2. COMANDO #APAGAR
-      if (comando.startsWith('#apagar')) {
-        const partes = comando.split(' ');
-        if (partes[1]) {
-          const { error } = await supabase.from('gastos').delete().eq('id', Number(partes[1]));
-          if (error) throw new Error('Supabase: ' + error.message);
-          return sock.sendMessage(jid, { text: `🗑️ Gasto ID ${partes[1]} removido!` });
-        } else {
-          const { data } = await supabase.from('gastos').select('id').order('id', { ascending: false }).limit(1);
-          if (data && data.length) {
-            await supabase.from('gastos').delete().eq('id', data[0].id);
-            return sock.sendMessage(jid, { text: `🗑️ Último gasto (ID ${data[0].id}) removido!` });
-          }
-        }
-        return;
-      }
-
-      // 3. REGISTRAR NOVO GASTO
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-      const prompt = `Extraia os dados deste gasto ou comprovante e retorne APENAS um JSON puro (sem markdown e sem crases) neste formato exato:
-      {"data": "DD/MM/AAAA", "estabelecimento": "nome curto", "categoria": "Mercado/Refeição/Transporte/Casa/Lazer/Outros", "valor": 0.00, "pagamento": "Pix/Crédito/Débito/Dinheiro"}
-      Use ponto para centavos no valor (ex: 25.50). Data de hoje: ${new Date().toLocaleDateString('pt-BR')}. Texto: ${texto}`;
-
-      let result;
-      if (temImagem) {
-        const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        result = await model.generateContent([
-          prompt,
-          { inlineData: { data: buffer.toString('base64'), mimeType: 'image/jpeg' } }
-        ]);
-      } else {
-        result = await model.generateContent(prompt);
-      }
-
-      const textoIA = result.response.text().replace(/```json|```/g, '').trim();
-      const dados = JSON.parse(textoIA);
-
-      const { data: inserido, error: dbError } = await supabase.from('gastos').insert([dados]).select();
-      if (dbError) throw new Error('Erro no Banco: ' + dbError.message);
-
-      const idGerado = (inserido && inserido[0]) ? inserido[0].id : 'OK';
-
-      await sock.sendMessage(jid, {
-        text: `✅ *Salvo [ID ${idGerado}]*\n🏪 *Local:* ${dados.estabelecimento}\n📂 *Cat:* ${dados.categoria}\n💰 *Valor:* R$ ${Number(dados.valor).toFixed(2)}\n💳 *Pag:* ${dados.pagamento}`
-      });
-    } catch (e) {
-      await sock.sendMessage(jid, { text: '❌ Motivo do erro: ' + e.message });
-    }
-  });
+    const idGerado = (inserido && inserido[0]) ? inserido[0].id : 'OK';
+    ctx.reply(`✅ *Salvo [ID ${idGerado}]*\n🏪 *Local:* ${dados.estabelecimento}\n📂 *Cat:* ${dados.categoria}\n💰 *Valor:* R$ ${Number(dados.valor).toFixed(2)}\n💳 *Pag:* ${dados.pagamento}`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    ctx.reply('❌ Erro: ' + e.message);
+  }
 }
 
-iniciarBot();
+// 4. Receber Texto normal (ex: "mercado 50 pix")
+bot.on('text', async (ctx) => {
+  if (ctx.message.text.startsWith('/')) return;
+  await processarGasto(ctx, [ctx.message.text]);
+});
+
+// 5. Receber Foto de Recibo/Comprovante
+bot.on('photo', async (ctx) => {
+  const photos = ctx.message.photo;
+  const fileId = photos[photos.length - 1].file_id;
+  const fileUrl = await ctx.telegram.getFileLink(fileId);
+  const res = await fetch(fileUrl.href);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const legenda = ctx.message.caption || '';
+  await processarGasto(ctx, [legenda, { inlineData: { data: buffer.toString('base64'), mimeType: 'image/jpeg' } }]);
+});
+
+// 6. Receber Áudio de Voz falando o gasto
+bot.on('voice', async (ctx) => {
+  const fileId = ctx.message.voice.file_id;
+  const fileUrl = await ctx.telegram.getFileLink(fileId);
+  const res = await fetch(fileUrl.href);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  await processarGasto(ctx, [{ inlineData: { data: buffer.toString('base64'), mimeType: 'audio/ogg' } }]);
+});
+
+bot.launch();
