@@ -1,107 +1,86 @@
-const { Telegraf } = require('telegraf');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { createClient } = require('@supabase/supabase-js');
-const express = require('express');
-
-const app = express();
-app.get('/', (req, res) => res.send('✅ Bot do Telegram rodando!'));
-app.listen(process.env.PORT || 3000);
-
-const bot = new Telegraf((process.env.TELEGRAM_TOKEN || '').trim());
-const genAI = new GoogleGenerativeAI((process.env.GEMINI_API_KEY || '').trim());
-const supabase = createClient((process.env.SUPABASE_URL || '').trim(), (process.env.SUPABASE_KEY || '').trim());
-
-// 1. Comando /start
-bot.start((ctx) => {
-  ctx.reply('👋 Olá! Mande qualquer gasto por texto, áudio ou foto de recibo.\n\nComandos:\n/resumo - Ver gastos do mês\n/apagar - Apagar o último gasto');
-});
-
-// 2. Comando /resumo
-bot.command('resumo', async (ctx) => {
-  try {
-    const { data: gastos, error } = await supabase.from('gastos').select('*').order('id', { ascending: false });
-    if (error) throw new Error(error.message);
-    if (!gastos || !gastos.length) return ctx.reply('📭 Nenhum gasto registrado ainda.');
-
-    let totalGeral = 0;
-    const porCategoria = {};
-    gastos.forEach(g => {
-      const val = Number(g.valor) || 0;
-      totalGeral += val;
-      porCategoria[g.categoria] = (porCategoria[g.categoria] || 0) + val;
-    });
-
-    let msg = `📊 RESUMO DE GASTOS\n💰 Total Geral: R$ ${totalGeral.toFixed(2)}\n\nPor Categoria:\n`;
-    for (const [cat, val] of Object.entries(porCategoria)) {
-      msg += `• ${cat}: R$ ${val.toFixed(2)}\n`;
-    }
-
-    msg += `\n🧾 Últimos 5 lançamentos:\n`;
-    gastos.slice(0, 5).forEach(g => {
-      msg += `[ID ${g.id}] ${g.data} - ${g.estabelecimento}: R$ ${Number(g.valor).toFixed(2)} (${g.pagamento})\n`;
-    });
-
-    await ctx.reply(msg);
-  } catch (e) {
-    await ctx.reply('❌ Erro ao buscar resumo: ' + e.message);
-  }
-});
-
-// 3. Comando /apagar
-bot.command('apagar', async (ctx) => {
-  try {
-    const partes = ctx.message.text.split(' ');
-    const idAlvo = partes[1];
-    if (idAlvo) {
-      await supabase.from('gastos').delete().eq('id', Number(idAlvo));
-      return ctx.reply(`🗑️ Gasto ID ${idAlvo} removido!`);
-    }
-    const { data } = await supabase.from('gastos').select('id').order('id', { ascending: false }).limit(1);
-    if (data && data.length) {
-      await supabase.from('gastos').delete().eq('id', data[0].id);
-      return ctx.reply(`🗑️ Último gasto (ID ${data[0].id}) removido!`);
-    }
-    await ctx.reply('📭 Nada para apagar.');
-  } catch (e) {
-    await ctx.reply('❌ Erro ao apagar: ' + e.message);
-  }
-});
-
-// Função auxiliar para processar e salvar no Supabase
+// Função auxiliar com leitura instantânea para texto e timeout contra travamento
 async function processarGasto(ctx, partesConteudo) {
   const msgEspera = await ctx.reply('⏳ Lendo gasto...');
+  
+  const responderFinal = async (textoFinal) => {
+    try {
+      await ctx.telegram.editMessageText(ctx.chat.id, msgEspera.message_id, null, textoFinal);
+    } catch (_) {
+      await ctx.reply(textoFinal);
+    }
+  };
+
   try {
-    const prompt = `Extraia os dados deste gasto (texto, áudio ou comprovante/recibo) e retorne APENAS um JSON puro neste formato exato:
-    {"data": "DD/MM/AAAA", "estabelecimento": "nome curto", "categoria": "Mercado/Refeição/Transporte/Casa/Lazer/Outros", "valor": 0.00, "pagamento": "Pix/Crédito/Débito/Dinheiro"}
-    Use ponto nos centavos (ex: 35.90). Data de hoje se não informada: ${new Date().toLocaleDateString('pt-BR')}.`;
+    let dados = null;
+    const dataHoje = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
-    const modelos = ['gemini-3.8-flash', 'gemini-3.8-flash-lite', 'gemini-2.0-flash'];
-    let result = null;
-    let ultimoErro = null;
+    // 1. ATALHO INSTANTÂNEO (0.1s): Se for texto simples (ex: "chiclete 3,00 credito"), nem espera a IA!
+    if (partesConteudo.length === 1 && typeof partesConteudo[0] === 'string') {
+      const txt = partesConteudo[0].replace('Texto do usuário:', '').trim();
+      const matchValor = txt.match(/(\d+[.,]?\d*)/);
+      
+      if (matchValor) {
+        const valorNum = Number(matchValor[1].replace(',', '.'));
+        const txtLower = txt.toLowerCase();
+        
+        let pagamento = 'Outros';
+        if (/pix/.test(txtLower)) pagamento = 'Pix';
+        else if (/cr[eé]dito|cartao|cartão/.test(txtLower)) pagamento = 'Crédito';
+        else if (/d[eé]bito/.test(txtLower)) pagamento = 'Débito';
+        else if (/dinheiro|esp[eé]cie/.test(txtLower)) pagamento = 'Dinheiro';
 
-    for (const nomeModelo of modelos) {
-      for (let tentativa = 1; tentativa <= 2; tentativa++) {
-        try {
-          const model = genAI.getGenerativeModel({ model: nomeModelo });
-          result = await model.generateContent([prompt, ...partesConteudo]);
-          break;
-        } catch (err) {
-          ultimoErro = err;
-          await new Promise(r => setTimeout(r, 2000));
-        }
+        let estabelecimento = txt
+          .replace(matchValor[0], '')
+          .replace(/\b(no|na|em|de|do|da|reais|r\$|pix|cr[eé]dito|d[eé]bito|dinheiro|cart[aã]o)\b/gi, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (!estabelecimento) estabelecimento = 'Gasto Geral';
+        estabelecimento = estabelecimento.charAt(0).toUpperCase() + estabelecimento.slice(1);
+
+        let categoria = 'Outros';
+        if (/mercado|atacad|compras|açougue|acougue|hortifruti/.test(txtLower)) categoria = 'Mercado';
+        else if (/padaria|lanche|restaurante|ifood|almo[çc]o|janta|chiclete|doce|caf[eé]|pizza|burger|bar/.test(txtLower)) categoria = 'Refeição';
+        else if (/uber|99|gasolina|combust[ií]vel|estacionamento|ped[aá]gio|onibus/.test(txtLower)) categoria = 'Transporte';
+        else if (/luz|água|agua|internet|aluguel|condom[ií]nio|casa|farm[aá]cia|rem[eé]dio/.test(txtLower)) categoria = 'Casa';
+        else if (/cinema|jogo|festa|passeio|streaming|assinatura|lazer/.test(txtLower)) categoria = 'Lazer';
+
+        dados = { data: dataHoje, estabelecimento, categoria, valor: valorNum, pagamento };
       }
-      if (result) break;
     }
 
-    if (!result) throw ultimoErro;
+    // 2. SE FOR FOTO DE RECIBO OU ÁUDIO: Usa o Gemini com Timeout de 12 segundos por tentativa
+    if (!dados) {
+      const prompt = `Extraia os dados deste gasto e retorne APENAS um JSON puro neste formato exato:
+      {"data": "DD/MM/AAAA", "estabelecimento": "nome curto", "categoria": "Mercado/Refeição/Transporte/Casa/Lazer/Outros", "valor": 0.00, "pagamento": "Pix/Crédito/Débito/Dinheiro"}
+      Use ponto nos centavos (ex: 35.90). Data de hoje: ${dataHoje}.`;
 
-    const textoBruto = result.response.text();
-    const matchJSON = textoBruto.match(/\{[\s\S]*\}/);
-    if (!matchJSON) throw new Error('A IA não retornou um JSON válido: ' + textoBruto);
-    const dados = JSON.parse(matchJSON[0]);
+      const modelos = ['gemini-3.8-flash-lite', 'gemini-3.8-flash'];
+      let result = null;
+      let ultimoErro = null;
 
+      for (const nomeModelo of modelos) {
+        try {
+          const model = genAI.getGenerativeModel({ model: nomeModelo });
+          const promessaIA = model.generateContent([prompt, ...partesConteudo]);
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Tempo limite da IA excedido (12s)')), 12000));
+          result = await Promise.race([promessaIA, timeout]);
+          if (result) break;
+        } catch (err) {
+          ultimoErro = err;
+        }
+      }
+
+      if (!result) throw ultimoErro;
+
+      const textoBruto = result.response.text();
+      const matchJSON = textoBruto.match(/\{[\s\S]*\}/);
+      if (!matchJSON) throw new Error('Formato inválido retornado pela IA.');
+      dados = JSON.parse(matchJSON[0]);
+    }
+
+    // 3. SALVA NO SUPABASE
     const { data: inserido, error } = await supabase.from('gastos').insert([{
-      data: String(dados.data || ''),
+      data: String(dados.data || dataHoje),
       estabelecimento: String(dados.estabelecimento || 'Outros'),
       categoria: String(dados.categoria || 'Outros'),
       valor: Number(String(dados.valor).replace(',', '.')) || 0,
@@ -111,46 +90,10 @@ async function processarGasto(ctx, partesConteudo) {
     if (error) throw new Error('Banco de dados: ' + error.message);
 
     const idGerado = (inserido && inserido[0]) ? inserido[0].id : 'OK';
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      msgEspera.message_id,
-      null,
+    await responderFinal(
       `✅ Salvo [ID ${idGerado}]\n🏪 Local: ${dados.estabelecimento}\n📂 Cat: ${dados.categoria}\n💰 Valor: R$ ${Number(dados.valor).toFixed(2)}\n💳 Pag: ${dados.pagamento}`
     );
   } catch (e) {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      msgEspera.message_id,
-      null,
-      '❌ Erro: ' + e.message
-    );
+    await responderFinal('❌ Erro: ' + e.message);
   }
 }
-
-// 4. Receber Texto normal
-bot.on('text', async (ctx) => {
-  if (ctx.message.text.startsWith('/')) return;
-  await processarGasto(ctx, ['Texto do usuário: ' + ctx.message.text]);
-});
-
-// 5. Receber Foto de Recibo
-bot.on('photo', async (ctx) => {
-  const photos = ctx.message.photo;
-  const fileId = photos[photos.length - 1].file_id;
-  const fileUrl = await ctx.telegram.getFileLink(fileId);
-  const res = await fetch(fileUrl.href);
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const legenda = ctx.message.caption || '';
-  await processarGasto(ctx, [legenda, { inlineData: { data: buffer.toString('base64'), mimeType: 'image/jpeg' } }]);
-});
-
-// 6. Receber Áudio de Voz
-bot.on('voice', async (ctx) => {
-  const fileId = ctx.message.voice.file_id;
-  const fileUrl = await ctx.telegram.getFileLink(fileId);
-  const res = await fetch(fileUrl.href);
-  const buffer = Buffer.from(await res.arrayBuffer());
-  await processarGasto(ctx, [{ inlineData: { data: buffer.toString('base64'), mimeType: 'audio/ogg' } }]);
-});
-
-bot.launch({ dropPendingUpdates: true });
